@@ -63,6 +63,44 @@ pip install -r requirements.txt  # create one if you don’t have it yet
 ./faraonic.py
 ```
 
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ FFFFFFFF    AAAA    RRRRRR     AAAA     OOOOOO    N     N    IIIII    CCCCC  │
+│ FF         A    A   RR   RR   A    A   O      O   NN    N      I     C       │
+│ FFFFFF     AAAAAA   RRRRRR    AAAAAA   O      O   N N   N      I     C       │
+│ FF         A    A   RR  RR    A    A   O      O   N  N  N      I     C       │
+│ FF         A    A   RR   RR   A    A    OOOOOO    N   N N    IIIII    CCCCC  │
+└──────────────────────────────────────────────────────────────────────────────┘
+Framework for Anomaly Recognition and Analysis in Operational Networks for Industrial Cybersecurity
+By Fabio Araujo
+
+usage: faraonic.py [-h] [--capture] [--query] [--train] [--realtime] [--show-config]
+                   [--cap-...] [--up-...]
+
+Modules:
+  RULES      → Baseline creation & rule-based real-time engine
+  BEHAVIORAL → ML training & live inference
+--------------------------------------------------------------------------------
+MAIN MENU
+
+== RULES ==
+  [1] Capture packets & upload baseline to MongoDB (interactive)
+  [2] Query baseline & start real-time rule engine
+
+== BEHAVIORAL ==
+  [3] Train model (if not exists)
+  [4] Real-time ML detection
+
+== GENERAL ==
+  [5] Show current configuration
+  [q] Quit
+
+Select an option: 
+```
+
+
+
+
 ### Common Actions
 
 **[1] Capture & Upload (interactive):**
