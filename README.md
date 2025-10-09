@@ -52,16 +52,33 @@ FARAONIC is a practical toolkit for monitoring **Industrial Control System (ICS)
 ## Quick Start
 
 > **Tip:** Use a dedicated Python virtual environment and keep **training and serving on the same scikit-learn version** to avoid pickle compatibility warnings.
+1) Create a virtualenv
+```bash
+python3 -m venv projeto
+```
+2) Activate a virtualenv
+```bash
+source projeto/bin/activate
+```
+3) Intall dependencies
+```bash
+pip install -r requirements.txt
+```
+4)Make the launcher executable (if needed)
+```bash
+chmod +x ./faraonic.py
+```
+5) Run the launcher (interactive menu)
 
 ```bash
-# 1) Create & activate venv (example)
-python3 -m venv projeto
-source projeto/bin/activate
-pip install -r requirements.txt  # create one if you don’t have it yet
-
-# 2) Run the launcher (interactive menu)
 ./faraonic.py
 ```
+
+> When you choose **option [4] – Real-time ML detection**, the launcher will **re-exec that script with `sudo`** (to enable packet capture) and your system will **prompt for the password**. The rest of the menu runs without elevated privileges.
+
+> _Security tip:_ don’t add passwordless sudo for packet capture unless you really know what you’re doing. If you need a non-sudo setup, consider granting `cap_net_raw,cap_net_admin` to your Python interpreter or running via a capture helper with proper capabilities.
+
+
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -123,7 +140,7 @@ Model options (pick with --models):
 Default: --models dt,rf (treina os dois)
 
 ```bash
-./11-ML-v2.py \
+./102-Treinar-ML.py \
   -i dataset/dataset_unico.csv \
   --safe-exclude \
   --mk-bitcount-delta \
