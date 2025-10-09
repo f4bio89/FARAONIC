@@ -4,9 +4,9 @@
 
 FARAONIC is a practical toolkit for monitoring **Industrial Control System (ICS)** traffic—especially **Modbus/TCP**—to build baselines, query/inspect data, and detect anomalies using **rules** and **machine learning** in real time.
 
-* ⚙️ **Operational focus:** works with live traffic (pcap/sniff) and production-friendly JSON/CSV outputs.
-* 🧠 **Two engines:** rule-based (baseline + detection) and behavioral (ML training + inference).
-* 🧰 **Batteries included:** capture, upload to MongoDB, aggregation queries, model training, and live inference, all from a single launcher.
+* **Operational focus:** works with live traffic (pcap/sniff) and production-friendly JSON/CSV outputs.
+* **Two engines:** rule-based (baseline + detection) and behavioral (ML training + inference).
+* **Batteries included:** capture, upload to MongoDB, aggregation queries, model training, and live inference, all from a single launcher.
 
 ---
 
@@ -113,7 +113,14 @@ Select an option:
 * Runs queries (optionally with `allowDiskUse`/`limit`)
 * Extracts a JSON summary and launches the rule detector with inferred defaults.
 
-**[3] Train model (ML):**
+[3] Train model (ML)
+
+Model options (pick with --models):
+- dt → Decision Tree (sklearn.tree.DecisionTreeClassifier)
+- rf → Random Forest (sklearn.ensemble.RandomForestClassifier)
+ - Extra: --gridsearch faz um RandomizedSearchCV leve no RF
+
+Default: --models dt,rf (treina os dois)
 
 ```bash
 ./11-ML-v2.py \
@@ -182,7 +189,7 @@ Use `--show-config` to print the active configuration.
 
 ## Roadmap (suggested)
 
-* Pluggable protocol parsers beyond Modbus/TCP (e.g., DNP3, S7comm)
+* Pluggable protocol parsers beyond Modbus/TCP
 * Model registry + metadata checks (auto-warn on sklearn version mismatch)
 * Docker compose for Mongo + pipeline demos
 * Simple web viewer for alerts/baselines
