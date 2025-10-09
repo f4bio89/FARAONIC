@@ -1,4 +1,4 @@
-#!/home/kali/Desktop/arquivos-defensive/Final/projeto/bin/python
+#!./projeto/bin/python
 # -*- coding: utf-8 -*-
 
 """
