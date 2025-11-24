@@ -1,590 +1,375 @@
-#!./projeto/bin/python
+#!../projeto/bin/python
+# -*- coding: utf-8 -*-
+
 """
-102-Treinar-ML.py
-Version 2 of the ML pipeline for Modbus/TCP traffic, with opinionated defaults
-and full CLI overrides.
+Treinador RandomForest / DecisionTree
+Saídas (todas dentro de <pasta>/):
+- Report de classificação (.txt)
+- Matriz de confusão (.png)
+- SHAP summary_plot (bar) com nomes corretos das classes (.png)
+- (se DT) PNG da árvore de decisão
+- Arquivos .joblib (modelo, features, class_names)
 
-Defaults (can be changed via flags):
-  -i dataset/dataset_unico.csv
-  --safe-exclude (disable with --no-safe-exclude)
-  --mk-bitcount-delta (disable with --no-mk-bitcount-delta)
-  --save-model mymodels.joblib
-  --report-out ml_results/meu_report.md
-  --verbose (disable with --quiet)
+Argumentos úteis:
+  --csv, --sep, --target, --prefix
+  --model {rf,dt} (pode repetir; default: rf dt -> treina ambos)
+  --test-size, --random-state
+  --shap-test-size (amostra do teste p/ SHAP, default 3000)
+  --shap-bg-size   (background SHAP, default 200)
 
-Examples:
-  # use all defaults
-  ./11-ML-v2.py
-
-  # change input and disable bitcount-delta
-  ./11-ML-v2.py -i other.csv --no-mk-bitcount-delta
-
-  # disable safe-exclude and silence logs
-  ./11-ML-v2.py --no-safe-exclude --quiet
-
-  # enable gridsearch and change output model
-  ./11-ML-v2.py --gridsearch --save-model results/rf.joblib
+NOVO:
+  --eval-csv        (CSV de avaliação externo; se fornecido, NÃO faz split)
+  --eval-sep        (separador do CSV de avaliação; default = --sep)
+  --eval-target     (nome da coluna-alvo no CSV de avaliação; default = --target ou autodetect)
 """
-from __future__ import annotations
-import argparse
-import pandas as pd
-import numpy as np
-from ast import literal_eval
-import sys
+
 import os
-import datetime
+import re
 import warnings
+warnings.filterwarnings("ignore")
+
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import joblib
 
-# sklearn imports
-from sklearn.model_selection import train_test_split, GroupKFold, StratifiedKFold, RandomizedSearchCV
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from sklearn.tree import DecisionTreeClassifier, plot_tree
 from sklearn.ensemble import RandomForestClassifier
 
-# silence specific future warnings we know about
-warnings.filterwarnings("ignore", category=FutureWarning)
+# =================== ARGUMENTOS ===================
+parser = argparse.ArgumentParser(description="Treinamento (RF/DT) + Confusion + Report + SHAP bar")
+parser.add_argument("--csv", default="/home/kali/Desktop/arquivos-defensive/Final/dataset/dataset_unico_filtrado.csv",
+                    help="Caminho do dataset CSV (treino)")
+parser.add_argument("--sep", default=";", help="Separador do CSV de treino (padrão: ';')")
+parser.add_argument("--target", default=None, help="Nome da coluna-alvo do treino (senão detecta)")
+parser.add_argument("--prefix", default="", help="Nome da PASTA de saída (se vazio, usa nome do CSV)")
+parser.add_argument("--model", nargs="+", choices=["rf", "dt"], default=["rf", "dt"],
+                    help="Quais modelos treinar (default: rf dt)")
+parser.add_argument("--test-size", type=float, default=0.30, help="Proporção do teste (padrão: 0.30)")
+parser.add_argument("--random-state", type=int, default=42, help="Seed")
+parser.add_argument("--shap-test-size", type=int, default=3000, help="Amostras do teste p/ SHAP (padrão: 3000)")
+parser.add_argument("--shap-bg-size", type=int, default=200, help="Amostras de background p/ SHAP (padrão: 200)")
+parser.add_argument("--max-display", type=int, default=20, help="Máx. features no SHAP bar (padrão: 20)")
 
-# -------------------------
-# Helpers (parsers / features)
-# -------------------------
-def parse_list_like(x):
-    if pd.isna(x) or x == '' or x == '[]':
-        return []
-    try:
-        return literal_eval(x)
-    except Exception:
-        return []
-
-def tcp_flag_bits(v):
-    if pd.isna(v):
-        v = 0
-    try:
-        v = int(v)
-    except Exception:
-        v = 0
-    return {
-        'tcp_fin':  v & 0x01 > 0,
-        'tcp_syn':  v & 0x02 > 0,
-        'tcp_rst':  v & 0x04 > 0,
-        'tcp_psh':  v & 0x08 > 0,
-        'tcp_ack':  v & 0x10 > 0,
-        'tcp_urg':  v & 0x20 > 0,
-        'tcp_ece':  v & 0x40 > 0,
-        'tcp_cwr':  v & 0x80 > 0,
-    }
-
-def extract_tsvals(opt_list):
-    if not isinstance(opt_list, list):
-        return np.nan, np.nan, 0, False
-    tsval, tsecr = np.nan, np.nan
-    nop_count = 0
-    for t, v in opt_list:
-        if t == 'NOP':
-            nop_count += 1
-        if t == 'Timestamp' and isinstance(v, tuple) and len(v) == 2:
-            tsval, tsecr = v[0], v[1]
-    return tsval, tsecr, nop_count, not np.isnan(tsval)
-
-def coalesce(*vals):
-    for v in vals:
-        if pd.notna(v):
-            return v
-    return np.nan
-
-def make_ohe_compat():
-    """Return a OneHotEncoder compatible with newer/older sklearn versions."""
-    try:
-        return OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown='ignore', sparse=False)
-
-def ensure_parent_dir(path: str):
-    """Create parent directory if needed (for output files)."""
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-
-# -------------------------
-# CLI (opinionated defaults + overrides)
-# -------------------------
-parser = argparse.ArgumentParser(
-    description="11-ML-v2.py - ML pipeline for Modbus/TCP (safe presets, time-split, group-kfold, report)"
-)
-
-# Defaults requested
-parser.add_argument('-i', '--input', default='dataset/dataset_unico.csv',
-                    help='Input CSV (default: dataset/dataset_unico.csv; use ; as separator if needed)')
-parser.add_argument('-t', '--target', default='Classification',
-                    help='Target column name (default: Classification)')
-parser.add_argument('-e', '--exclude-cols', default='',
-                    help='Extra columns to exclude (comma-separated)')
-
-# safe-exclude default ON, with option to turn off
-mx_safe = parser.add_mutually_exclusive_group()
-mx_safe.add_argument('--safe-exclude', dest='safe_exclude', action='store_true',
-                     help='Enable preset excludes (IPs, MACs, timestamps, checksums, trans_id, etc.) [DEFAULT]')
-mx_safe.add_argument('--no-safe-exclude', dest='safe_exclude', action='store_false',
-                     help='Disable the preset excludes')
-parser.set_defaults(safe_exclude=True)
-
-# bitcount-delta default ON, with option to turn off
-mx_bit = parser.add_mutually_exclusive_group()
-mx_bit.add_argument('--mk-bitcount-delta', dest='mk_bitcount_delta', action='store_true',
-                    help='Create bit_count_delta from ModbusWriteMultipleCoilsRequest_bit_count [DEFAULT]')
-mx_bit.add_argument('--no-mk-bitcount-delta', dest='mk_bitcount_delta', action='store_false',
-                    help='Do not create bit_count_delta')
-parser.set_defaults(mk_bitcount_delta=True)
-
-parser.add_argument('--test-size', type=float, default=0.25,
-                    help='Test split size (default 0.25)')
-parser.add_argument('--random-state', type=int, default=42, help='Random state (default 42)')
-parser.add_argument('--models', default='dt,rf', help='Which models to train: dt,rf (e.g., dt,rf)')
-parser.add_argument('--no-ml', action='store_true', help='Prepare X/y only, do not train models')
-
-# time split options
-parser.add_argument('--time-split-ts', default=None,
-                    help='Timestamp ISO threshold (e.g., 2025-10-01T12:00:00): train < TS, test >= TS')
-parser.add_argument('--time-split-minutes', type=int, default=None,
-                    help='Threshold = min(timestamp) + N minutes (train before, test after)')
-
-# group kfold
-parser.add_argument('--group-kfold', type=int, default=None,
-                    help='GroupKFold CV with K folds (uses flow_id as group).')
-
-parser.add_argument('--gridsearch', action='store_true',
-                    help='Run a light RandomizedSearchCV for RandomForest')
-
-# Outputs: requested defaults
-parser.add_argument('--save-model', default='mymodels.joblib',
-                    help='Path to save final pipeline/model (default: mymodels.joblib)')
-parser.add_argument('--report-out', default='ml_results/meu_report.md',
-                    help='Path to output Markdown report (default: ml_results/meu_report.md)')
-
-# Verbose ON by default; can silence with --quiet
-mx_verb = parser.add_mutually_exclusive_group()
-mx_verb.add_argument('--verbose', dest='verbose', action='store_true', help='Verbose [DEFAULT]')
-mx_verb.add_argument('--quiet', dest='verbose', action='store_false', help='Quiet mode')
-parser.set_defaults(verbose=True)
+# NOVOS ARGUMENTOS
+parser.add_argument("--eval-csv", default=None, help="Caminho do CSV de avaliação (sem split)")
+parser.add_argument("--eval-sep", default=None, help="Separador do CSV de avaliação (default = --sep)")
+parser.add_argument("--eval-target", default=None, help="Nome da coluna-alvo no CSV de avaliação (senão usa --target ou autodetect)")
 
 args = parser.parse_args()
 
-# -------------------------
-# Preset safe exclude
-# -------------------------
-preset_safe = [
-    'IP_src','IP_dst','Ether_src','Ether_dst',
-    'tcp_tsval','tcp_tsecr','timestamp',
-    'TCP_seq','TCP_ack',
-    'ModbusTCPRequest_trans_id','ModbusTCPResponse_trans_id',
-    'ModbusWriteMultipleCoilsRequest_reference_number'
-    # 'ModbusWriteMultipleCoilsRequest_bit_count'  # optional
-]
+# ------------------- Paths e pasta de saída -------------------
+def sanitize_name(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[\\/]+", "_", name)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_.")
+    return name or "run"
 
-EXCLUDE_COLS = [c.strip() for c in args.exclude_cols.split(',') if c.strip()]
-if args.safe_exclude:
-    # add preset without duplicates
-    EXCLUDE_COLS = list(dict.fromkeys(EXCLUDE_COLS + preset_safe))
+CSV_PATH = os.path.abspath(os.path.expanduser(args.csv.strip()))
+SEP = args.sep
+TARGET = args.target
+EVAL_CSV_PATH = os.path.abspath(os.path.expanduser(args.eval_csv.strip())) if args.eval_csv else None
+EVAL_SEP = args.eval_sep if args.eval_sep is not None else SEP
+EVAL_TARGET = args.eval_target
 
-if args.verbose:
-    print(f'[INFO] Input: {args.input}')
-    print(f'[INFO] Target: {args.target}')
-    print(f'[INFO] Exclude columns: {EXCLUDE_COLS}')
-    print(f'[INFO] Test size: {args.test_size}  Random state: {args.random_state}')
-    print(f'[INFO] Requested models: {args.models}; no-ml={args.no_ml}; gridsearch={args.gridsearch}')
-    print(f'[INFO] mk_bitcount_delta={args.mk_bitcount_delta}  safe_exclude={args.safe_exclude}')
+PREFIX_RAW = args.prefix
 
-# -------------------------
-# Load CSV
-# -------------------------
-try:
-    df = pd.read_csv(args.input, sep=';', engine='python')
-except Exception as e:
-    print(f'[ERROR] Failed to open {args.input}: {e}')
-    sys.exit(1)
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"CSV não encontrado: {CSV_PATH}")
+if EVAL_CSV_PATH and not os.path.exists(EVAL_CSV_PATH):
+    raise FileNotFoundError(f"CSV de avaliação não encontrado: {EVAL_CSV_PATH}")
 
-# basic timestamp conversion
-df['timestamp'] = pd.to_numeric(df.get('timestamp'), errors='coerce')
-df['event_time'] = pd.to_datetime(df['timestamp'], unit='s', errors='coerce')
-df = df.sort_values('timestamp').reset_index(drop=True)
-
-# -------------------------
-# Safe pre-processing (type casting)
-# -------------------------
-num_cols_guess = [
-    'Ether_type','IP_version','IP_ihl','IP_tos','IP_len','IP_id','IP_flags','IP_frag','IP_ttl',
-    'IP_proto','IP_chksum','TCP_sport','TCP_dport','TCP_seq','TCP_ack','TCP_dataofs',
-    'TCP_reserved','TCP_flags','TCP_window','TCP_chksum','TCP_urgptr',
-]
-modbus_num_guess = [c for c in [
-    'ModbusTCPRequest_trans_id','ModbusTCPRequest_prot_id','ModbusTCPRequest_length','ModbusTCPRequest_unit_id','ModbusTCPRequest_func_code',
-    'ModbusTCPResponse_trans_id','ModbusTCPResponse_prot_id','ModbusTCPResponse_length','ModbusTCPResponse_unit_id','ModbusTCPResponse_func_code',
-    'ModbusReadDiscreteInputsRequest_reference_number','ModbusReadDiscreteInputsRequest_bit_count',
-    'ModbusReadDiscreteInputsResponse_byte_count',
-    'ModbusWriteMultipleCoilsRequest_reference_number','ModbusWriteMultipleCoilsRequest_bit_count',
-    'ModbusWriteMultipleCoilsRequest_byte_count','ModbusWriteMultipleCoilsResponse_bit_count',
-    'ModbusWriteMultipleCoilsResponse_reference_number'
-] if c in df.columns]
-
-for c in num_cols_guess + modbus_num_guess:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
-
-for c in ['Ether_dst','Ether_src','IP_src','IP_dst']:
-    if c in df.columns:
-        try:
-            df[c] = df[c].astype('category')
-        except Exception:
-            pass
-
-# parse lists
-for c in ['IP_options','TCP_options','ModbusReadDiscreteInputsResponse_input_status','ModbusWriteMultipleCoilsRequest_coil_status']:
-    if c in df.columns:
-        df[c] = df[c].apply(parse_list_like)
-
-# -------------------------
-# Feature engineering
-# -------------------------
-# direction
-direction_arr = np.where(
-    df.get('TCP_dport', pd.Series(index=df.index)) == 502, 'cli_to_srv',
-    np.where(df.get('TCP_sport', pd.Series(index=df.index)) == 502, 'srv_to_cli', 'other')
-)
-df['direction'] = pd.Series(direction_arr, index=df.index).astype('category')
-
-# flags
-if 'TCP_flags' in df.columns:
-    flag_expanded = df['TCP_flags'].apply(tcp_flag_bits).apply(pd.Series)
-    df = pd.concat([df, flag_expanded], axis=1)
-
-# approx payload
-if set(['IP_len','IP_ihl','TCP_dataofs']).issubset(df.columns):
-    df['approx_payload_len'] = df['IP_len'] - (df['IP_ihl'] * 4) - (df['TCP_dataofs'] * 4)
+# Se prefix não for fornecido, usar o nome do CSV (sem extensão)
+if PREFIX_RAW.strip():
+    RUN_NAME = sanitize_name(PREFIX_RAW)
 else:
-    df['approx_payload_len'] = np.nan
+    RUN_NAME = sanitize_name(os.path.splitext(os.path.basename(CSV_PATH))[0])
 
-# modbus func
-if 'ModbusTCPRequest_func_code' in df.columns or 'ModbusTCPResponse_func_code' in df.columns:
-    df['modbus_func'] = df.apply(lambda r: coalesce(r.get('ModbusTCPRequest_func_code'), r.get('ModbusTCPResponse_func_code')), axis=1)
-    try:
-        df['modbus_func'] = df['modbus_func'].astype('Int64')
-    except Exception:
-        pass
+RUN_DIR = os.path.join(".", RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
 
-# tsvals
-if 'TCP_options' in df.columns:
-    ts_vals = df['TCP_options'].apply(extract_tsvals).apply(pd.Series)
-    ts_vals.columns = ['tcp_tsval','tcp_tsecr','tcp_nop_count','tcp_has_ts']
-    df = pd.concat([df, ts_vals], axis=1)
+TEST_SIZE = args.test_size
+RANDOM_STATE = args.random_state
+MODELS = args.model
+SHAP_TEST_SIZE = max(1, args.shap_test_size)
+SHAP_BG_SIZE = max(1, args.shap_bg_size)
+MAX_DISPLAY = args.max_display
 
-# flow_id
-for c in ['IP_src','IP_dst','TCP_sport','TCP_dport','IP_proto']:
-    if c not in df.columns:
-        df[c] = df.get(c, pd.Series(index=df.index))
-df['flow_id'] = (
-    df['IP_src'].astype(str) + '>' + df['IP_dst'].astype(str) + ':' +
-    df['TCP_sport'].astype(str) + '>' + df['TCP_dport'].astype(str) + '/' +
-    df['IP_proto'].astype(str)
-)
+print(f"[INFO] Pasta de saída: {os.path.abspath(RUN_DIR)}")
 
-# iat_flow
-df['iat_flow'] = df.groupby('flow_id')['timestamp'].diff()
+# =======================
+# Colunas a excluir
+# =======================
+EXCLUDE_COLUMNS_BASE: list[str] = [
+    "Ether_src", "Ether_dst", "Ether_type",
+    "IP_src", "IP_dst", "IP_version", "IP_proto", "IP_chksum",
+    "TCP_sport", "TCP_dport", "TCP_seq", "TCP_ack", "TCP_dataofs",
+    "TCP_reserved", "TCP_chksum", "TCP_urgptr", "TCP_options",
+    "ModbusReadDiscreteInputsRequest_reference_number",
+    "ModbusWriteMultipleCoilsRequest_reference_number",
+    "ModbusWriteMultipleCoilsResponse_reference_number"
+]
+EXCLUDE_COLUMNS_BASE: list[str] = []
+# ajuste rápido via variáveis (mantido do seu script)
+teste2="TCP_flags"
+teste3="IP_flags"
+teste4="IP_tos" # piorou um pouco se tirar
+teste5="IP_len"
+teste6="ModbusTCPRequest_length"
+teste7="ModbusTCPRequest_trans_id"
+teste8="ModbusTCPRequest_func_code"
+teste9="TCP_window"
+teste10="ModbusReadDiscreteInputsRequest_bit_count"
+teste11="timestamp"
+EXCLUDE_COLUMNS_EXTRA: list[str] = [
+    teste7, teste11,teste3, teste2, teste4, 
+    teste6
+]
+EXCLUDE_COLUMNS_EXTRA: list[str] = []
+EXCLUDE_COLUMNS = list(set(EXCLUDE_COLUMNS_BASE + EXCLUDE_COLUMNS_EXTRA))
 
-# deltas
-for col, newcol in [('TCP_seq','delta_seq'), ('TCP_ack','delta_ack'), ('TCP_window','delta_win')]:
-    if col in df.columns:
-        df[newcol] = df.groupby('flow_id')[col].diff()
+# =================== HELPERS ===================
+def outpath(name: str) -> str:
+    return os.path.join(RUN_DIR, name)
 
-if 'tcp_tsval' in df.columns:
-    df['delta_tsval'] = df.groupby('flow_id')['tcp_tsval'].diff()
+def salvar_matriz_confusao(cm, class_names, titulo, filename):
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(titulo)
+    plt.xlabel('Classe Predita')
+    plt.ylabel('Classe Real')
+    plt.tight_layout()
+    path = outpath(filename)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"[SALVO] {path}")
 
-if 'IP_id' in df.columns:
-    df['ip_id_delta'] = df.groupby(['IP_src','IP_dst'], observed=False)['IP_id'].diff()
-
-# optional bit_count_delta
-if args.mk_bitcount_delta:
-    src = 'ModbusWriteMultipleCoilsRequest_bit_count'
-    if src in df.columns:
-        df['bit_count_delta'] = df.groupby('flow_id')[src].diff()
-        if args.verbose:
-            print('[INFO] Created bit_count_delta feature.')
-    else:
-        print('[WARN] bit_count_delta requested but source column not found:', src)
-
-# -------------------------
-# Prepare target and drop columns
-# -------------------------
-target_col = args.target
-if target_col in (set([c.strip() for c in preset_safe]) if args.safe_exclude else set()):
-    print(f'[ERROR] Target "{target_col}" cannot be in the preset excludes. Use --no-safe-exclude or change the target.')
-    sys.exit(1)
-
-y = None
-if target_col in df.columns:
-    df[target_col] = df[target_col].astype('string')
-    y = df[target_col].astype('category')
-
-drop_cols = set([
-    target_col,
-    'TCP_options','IP_options',
-    'ModbusReadDiscreteInputsResponse_input_status',
-    'ModbusWriteMultipleCoilsRequest_coil_status',
-    'event_time','flow_id'
-])
-drop_cols.update(EXCLUDE_COLS)
-
-missing_excludes = [c for c in EXCLUDE_COLS if c not in df.columns and c not in preset_safe]
-if missing_excludes and args.verbose:
-    print('[WARN] Exclude columns not found in CSV (may be fine):', missing_excludes)
-
-existing_drop = [c for c in drop_cols if c in df.columns]
-X = df.drop(columns=existing_drop)
-
-if args.verbose:
-    print('[INFO] X columns preview:', X.columns.tolist()[:40])
-    print('[INFO] X shape:', X.shape)
-    print('[INFO] y distribution:\n', (y.value_counts() if y is not None else 'No target'))
-
-# Save a quick X/y snapshot (helpful to inspect)
-preview_dir = os.path.join(os.getcwd(), 'ml_previews')
-os.makedirs(preview_dir, exist_ok=True)
-try:
-    X.head(5).to_csv(os.path.join(preview_dir, 'X_head_preview.csv'), index=False)
-    if y is not None:
-        y.value_counts().to_csv(os.path.join(preview_dir, 'y_counts_preview.csv'))
-except Exception:
-    pass
-
-# -------------------------
-# If --no-ml just exit after preprocessing
-# -------------------------
-if args.no_ml:
-    print('[INFO] --no-ml set: preprocessing done. Exiting.')
-    sys.exit(0)
-
-if y is None:
-    print('[INFO] No target column found; cannot run ML. Exiting.')
-    sys.exit(0)
-
-# -------------------------
-# Prepare columns lists for preprocessing
-# -------------------------
-cat_cols = [c for c in X.columns if str(X[c].dtype) in ('category','object','string')]
-num_cols = [c for c in X.columns if c not in cat_cols]
-
-if args.verbose:
-    print(f'[INFO] num_cols: {len(num_cols)}  cat_cols: {len(cat_cols)}')
-
-numeric_tf = Pipeline([('imputer', SimpleImputer(strategy='median'))])
-categorical_tf = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', make_ohe_compat())])
-
-preproc = ColumnTransformer(
-    transformers=[('num', numeric_tf, num_cols), ('cat', categorical_tf, cat_cols)],
-    remainder='drop'
-)
-
-# -------------------------
-# Train/test split: time-split or random split
-# -------------------------
-X_train = X_test = y_train = y_test = None
-groups = df['flow_id'] if 'flow_id' in df.columns else None
-
-if args.time_split_ts:
-    try:
-        ts = pd.to_datetime(args.time_split_ts)
-        train_mask = df['event_time'] < ts
-        test_mask = df['event_time'] >= ts
-        if train_mask.sum() == 0 or test_mask.sum() == 0:
-            print('[ERROR] time-split-ts produced empty train or test. Check the provided timestamp.')
-            sys.exit(1)
-        X_train = X[train_mask]; X_test = X[test_mask]
-        y_train = y[train_mask]; y_test = y[test_mask]
-        groups_train = groups[train_mask] if groups is not None else None
-        groups_test = groups[test_mask] if groups is not None else None
-        if args.verbose:
-            print(f'[INFO] Time split at {ts}: train={X_train.shape[0]} test={X_test.shape[0]}')
-    except Exception as e:
-        print('[ERROR] --time-split-ts parse error:', e); sys.exit(1)
-elif args.time_split_minutes is not None:
-    min_ts = df['timestamp'].min()
-    if pd.isna(min_ts):
-        print('[ERROR] timestamp column missing or invalid; cannot use time-split-minutes.'); sys.exit(1)
-    threshold = min_ts + (args.time_split_minutes * 60)
-    train_mask = df['timestamp'] < threshold
-    test_mask = df['timestamp'] >= threshold
-    if train_mask.sum() == 0 or test_mask.sum() == 0:
-        print('[ERROR] time-split-minutes produced empty train/test. Pick a different minutes value.'); sys.exit(1)
-    X_train = X[train_mask]; X_test = X[test_mask]
-    y_train = y[train_mask]; y_test = y[test_mask]
-    groups_train = groups[train_mask] if groups is not None else None
-    groups_test = groups[test_mask] if groups is not None else None
-    if args.verbose:
-        print(f'[INFO] Time split (min): threshold={datetime.datetime.utcfromtimestamp(threshold)} train={X_train.shape[0]} test={X_test.shape[0]}')
-else:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.random_state, stratify=y
+def salvar_arvore_decisao_png(modelo_dt, feature_names, class_names,
+                              filename_png, max_depth_plot=4):
+    plt.figure(figsize=(24, 18))
+    plot_tree(
+        modelo_dt,
+        feature_names=feature_names,
+        class_names=class_names,
+        filled=True,
+        rounded=True,
+        max_depth=max_depth_plot,
+        fontsize=8
     )
-    groups_train = groups.loc[X_train.index] if groups is not None else None
-    groups_test = groups.loc[X_test.index] if groups is not None else None
-    if args.verbose:
-        print(f'[INFO] Random stratified split: train={X_train.shape[0]} test={X_test.shape[0]}')
+    plt.tight_layout()
+    path_png = outpath(filename_png)
+    plt.savefig(path_png, dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"[SALVO] {path_png}")
 
-# -------------------------
-# Model pipelines
-# -------------------------
-models_to_run = [m.strip().lower() for m in args.models.split(',') if m.strip()]
-pipelines = {}
+def avaliar_modelo(modelo, nome_modelo, X_eval, y_eval, class_names, sufixo=""):
+    y_pred = modelo.predict(X_eval)
+    f1 = f1_score(y_eval, y_pred, average='weighted')
+    print(f"\n{nome_modelo}{sufixo} - F1 weighted: {f1:.4f}\n")
+    report = classification_report(y_eval, y_pred, target_names=class_names, digits=4)
+    print(f"Relatório por classe ({nome_modelo}{sufixo}):\n{report}")
 
-if 'dt' in models_to_run:
-    pipelines['DecisionTree'] = Pipeline([
-        ('prep', preproc),
-        ('clf', DecisionTreeClassifier(random_state=args.random_state, class_weight='balanced'))
-    ])
+    rep_path = outpath(f"{nome_modelo.lower()}{sufixo}_report.txt")
+    with open(rep_path, "w", encoding="utf-8") as f:
+        f.write(f"{nome_modelo}{sufixo} - F1 weighted: {f1:.4f}\n\n")
+        f.write(report)
+    print(f"[SALVO] {rep_path}")
 
-if 'rf' in models_to_run:
-    rf_clf = RandomForestClassifier(
-        n_estimators=200, random_state=args.random_state, n_jobs=-1,
-        class_weight='balanced_subsample'
-    )
-    if args.gridsearch:
-        pipelines['RandomForest'] = Pipeline([('prep', preproc), ('clf', rf_clf)])
-        if args.verbose:
-            print('[INFO] Gridsearch enabled for RandomForest (RandomizedSearchCV).')
-    else:
-        pipelines['RandomForest'] = Pipeline([('prep', preproc), ('clf', rf_clf)])
+    cm = confusion_matrix(y_eval, y_pred)
+    salvar_matriz_confusao(cm, class_names,
+                           f"Matriz de Confusão — {nome_modelo}{sufixo}",
+                           f"{nome_modelo.lower()}{sufixo}_confusion_matrix.png")
+    return f1
 
-# -------------------------
-# If gridsearch requested, run RandomizedSearchCV (only for RF) using train set
-# -------------------------
-if args.gridsearch and 'rf' in models_to_run:
-    base_pipeline = pipelines['RandomForest']
-    param_dist = {
-        'clf__n_estimators': [100, 200, 300],
-        'clf__max_depth': [None, 10, 20],
-        'clf__min_samples_leaf': [1, 2, 5],
-        'clf__max_features': ['sqrt', 'log2', 0.3]
-    }
-    rnd = RandomizedSearchCV(
-        base_pipeline, param_distributions=param_dist, n_iter=8, cv=3,
-        verbose=1 if args.verbose else 0, n_jobs=-1, random_state=args.random_state
-    )
-    if args.verbose:
-        print('[INFO] Running RandomizedSearchCV on RandomForest pipeline...')
-    rnd.fit(X_train, y_train)
-    if args.verbose:
-        print('[INFO] RandomizedSearchCV done. Best params:', rnd.best_params_)
-    pipelines['RandomForest'] = rnd.best_estimator_
-
-# -------------------------
-# Training & Evaluation
-# -------------------------
-report_lines = []
-results_folder = os.path.join(os.getcwd(), 'ml_results')
-os.makedirs(results_folder, exist_ok=True)
-
-for name, model in pipelines.items():
-    print(f'\n[INFO] Training {name}...')
-    model.fit(X_train, y_train)
-    print(f'[INFO] Evaluating {name}...')
-    y_pred = model.predict(X_test)
-    creport = classification_report(y_test, y_pred, zero_division=0)
-    cm = confusion_matrix(y_test, y_pred)
-    print(f'===== {name} =====')
-    print(creport)
-    print('Confusion matrix:\n', cm)
-
-    # feature importances if available
-    imp_text = ''
+def shap_bar_with_true_labels(model, X_train, X_for_shap, class_names, model_name,
+                              max_display=20, bg_size=200, test_size=3000, seed=42):
     try:
-        clf = model.named_steps['clf']
-        if hasattr(clf, 'feature_importances_'):
-            # recover feature names
-            num_names = num_cols
-            cat_names = []
-            if len(cat_cols) > 0:
-                ohe = model.named_steps['prep'].named_transformers_['cat'].named_steps['onehot']
+        import shap
+        X_bg = X_train.sample(min(bg_size, len(X_train)), random_state=seed)
+        X_ts = X_for_shap.sample(min(test_size, len(X_for_shap)), random_state=seed)
+
+        explainer = shap.TreeExplainer(
+            model,
+            data=X_bg,
+            feature_perturbation="interventional"
+        )
+        sv = explainer.shap_values(X_ts, check_additivity=False)
+
+        plt.figure()
+        shap.summary_plot(sv, X_ts, plot_type="bar", show=False, max_display=max_display)
+
+        ax = plt.gca()
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            new_labels = []
+            for lbl in labels:
                 try:
-                    cat_names = ohe.get_feature_names_out(cat_cols).tolist()
+                    idx = int(lbl.split()[-1])
+                    new_labels.append(str(class_names[idx]))
                 except Exception:
-                    cat_names = [f'cat_{i}' for i in range(len(cat_cols))]
-            all_names = num_names + cat_names
-            importances = clf.feature_importances_
-            if len(importances) == len(all_names):
-                imp_df = pd.DataFrame({'feature': all_names, 'importance': importances}).sort_values('importance', ascending=False)
-                imp_text = imp_df.head(50).to_markdown(index=False)
-                print(f'\nTop 25 importances ({name}):')
-                print(imp_df.head(25).to_string(index=False))
-            else:
-                imp_text = '[WARN] importances length mismatch'
+                    new_labels.append(lbl)
+            ax.legend(handles, new_labels, loc='best', ncol=2, fontsize=8, title=None)
+
+        plt.title(f"Importância SHAP — {model_name}")
+        plt.tight_layout()
+        path_bar = outpath(f"{model_name.lower()}_shap_bar.png")
+        plt.savefig(path_bar, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[SALVO] {path_bar}")
     except Exception as e:
-        imp_text = f'[WARN] Could not extract importances: {e}'
+        print(f"[AVISO] SHAP {model_name} falhou: {e}")
 
-    # Save results to report buffer
-    report_lines.append(f'## Model: {name}\n')
-    report_lines.append('### Classification Report\n')
-    report_lines.append('```\n' + creport + '\n```\n')
-    report_lines.append('### Confusion Matrix\n')
-    report_lines.append('```\n' + str(cm.tolist()) + '\n```\n')
-    if imp_text:
-        report_lines.append('### Top feature importances (preview)\n')
-        report_lines.append(imp_text + '\n')
+def autodetect_target(df, prefer=None):
+    if prefer:
+        return prefer
+    for cand in ['classe', 'Classification', 'class', 'label', 'target']:
+        match = [c for c in df.columns if c.lower() == cand.lower()]
+        if match:
+            return match[0]
+    return None
 
-# -------------------------
-# Optionally: GroupKFold evaluation (cross-val) if requested
-# -------------------------
-if args.group_kfold is not None and args.group_kfold > 1:
-    k = args.group_kfold
-    print(f'[INFO] Running GroupKFold (k={k}) cross-validation on the first available model (for speed).')
-    eval_model_name = 'RandomForest' if 'RandomForest' in pipelines else next(iter(pipelines.keys()))
-    estimator = pipelines[eval_model_name]
-    gkf = GroupKFold(n_splits=k)
-    fold = 0
-    cv_reports = []
-    for train_idx, test_idx in gkf.split(X, y, groups=df['flow_id']):
-        fold += 1
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        estimator.fit(X_tr, y_tr)
-        y_p = estimator.predict(X_te)
-        crep = classification_report(y_te, y_p, zero_division=0)
-        print(f'[CV] Fold {fold} report:\n{crep}')
-        cv_reports.append((fold, crep))
-    report_lines.append('## GroupKFold Cross-Validation\n')
-    for fnum, crep in cv_reports:
-        report_lines.append(f'### Fold {fnum}\n```\n{crep}\n```\n')
+def preparar_X(df_in, exclude_cols, feature_order=None):
+    Xr = df_in.drop(columns=[c for c in exclude_cols if c in df_in.columns], errors="ignore")
+    if feature_order is not None:
+        # Mantém somente colunas esperadas; cria as ausentes com NaN
+        for col in feature_order:
+            if col not in Xr.columns:
+                Xr[col] = np.nan
+        Xr = Xr[feature_order]
+    Xr = Xr.apply(pd.to_numeric, errors='coerce').astype(np.float32)
+    return Xr
 
-# -------------------------
-# Save pipeline/model + report
-# -------------------------
-final_model_path = args.save_model
-try:
-    ensure_parent_dir(final_model_path)
-    if len(pipelines) == 1:
-        single = list(pipelines.values())[0]
-        joblib.dump(single, final_model_path)
+
+# =================== PIPELINE ===================
+# 1) Carregar treino
+df_train = pd.read_csv(CSV_PATH, delimiter=SEP, low_memory=False)
+
+# 2) Duplicatas
+before = len(df_train)
+df_train = df_train.drop_duplicates()
+after = len(df_train)
+print(f"[INFO] Removidas {before - after} duplicatas (restaram {after}).")
+
+# 3) Target treino
+if TARGET is None:
+    TARGET = autodetect_target(df_train)
+    if TARGET is None:
+        raise ValueError("Não encontrei coluna-alvo no treino. Use --target NOME_DA_COLUNA.")
+print(f"[INFO] Coluna-alvo (treino): {TARGET}")
+
+# 4) X/y treino e exclusões
+y_train_raw = df_train[TARGET]
+X_train_raw = df_train.drop(columns=[TARGET])
+cols_to_drop_train = [c for c in EXCLUDE_COLUMNS if c in X_train_raw.columns]
+if cols_to_drop_train:
+    print(f"[INFO] Excluindo {len(cols_to_drop_train)} colunas (treino/leakage): {cols_to_drop_train}")
+    X_train_raw = X_train_raw.drop(columns=cols_to_drop_train)
+
+# 5) Numérico + float32 (treino)
+X_train = X_train_raw.apply(pd.to_numeric, errors='coerce').astype(np.float32)
+
+
+# 6) Encode alvo (ajusta em cima do treino)
+le = LabelEncoder()
+y_train = le.fit_transform(y_train_raw)
+class_names = list(le.classes_)
+print("Mapeamento das classes (treino):")
+for i, c in enumerate(class_names):
+    print(f"  {i} -> {c}")
+
+# Preparação de conjuntos de avaliação:
+use_external_eval = EVAL_CSV_PATH is not None
+
+if use_external_eval:
+    # 7A) Carregar avaliação externa
+    df_eval = pd.read_csv(EVAL_CSV_PATH, delimiter=EVAL_SEP, low_memory=False)
+    if EVAL_TARGET is None:
+        EVAL_TARGET = autodetect_target(df_eval, prefer=args.target)
+        if EVAL_TARGET is None:
+            raise ValueError("Não encontrei coluna-alvo no CSV de avaliação. Use --eval-target NOME.")
+    print(f"[INFO] Coluna-alvo (avaliação): {EVAL_TARGET}")
+
+    y_eval_raw = df_eval[EVAL_TARGET]
+    X_eval_raw = df_eval.drop(columns=[EVAL_TARGET])
+
+    # remover mesmas colunas de leakage
+    cols_to_drop_eval = [c for c in EXCLUDE_COLUMNS if c in X_eval_raw.columns]
+    if cols_to_drop_eval:
+        print(f"[INFO] Excluindo {len(cols_to_drop_eval)} colunas (avaliação/leakage): {cols_to_drop_eval}")
+        X_eval_raw = X_eval_raw.drop(columns=cols_to_drop_eval)
+
+    # alinhar colunas com treino
+    train_features = X_train.columns.tolist()
+    X_eval = preparar_X(X_eval_raw, exclude_cols=[], feature_order=train_features)
+
+    # transformar y_eval com o mesmo encoder; filtrar classes desconhecidas
+    known_classes = set(le.classes_)
+    mask_known = y_eval_raw.astype(str).isin(known_classes)
+    if not mask_known.all():
+        desconhecidas = sorted(set(y_eval_raw.astype(str)[~mask_known]))
+        print(f"[AVISO] Removendo {(~mask_known).sum()} amostras com classes NÃO vistas no treino: {desconhecidas}")
+        X_eval = X_eval[mask_known.values]
+        y_eval_raw = y_eval_raw[mask_known.values]
+
+    y_eval = le.transform(y_eval_raw.astype(str))
+    # Para SHAP, usaremos o próprio X_eval (amostrado)
+    X_for_shap = X_eval.copy()
+else:
+    # 7B) Sem avaliação externa: faz split interno
+    from sklearn.model_selection import train_test_split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_train, y_train, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_train
+    )
+    X_eval, y_eval = X_test, y_test
+    X_for_shap = X_test.copy()
+    print(f"[INFO] Sem --eval-csv: usando split interno com test_size={TEST_SIZE}")
+
+# =================== TREINOS ===================
+for m in MODELS:
+    if m == "rf":
+        model = RandomForestClassifier(n_estimators=400, max_depth=None, n_jobs=-1, random_state=RANDOM_STATE)
+        model_name = "RandomForest"
+    elif m == "dt":
+        model = DecisionTreeClassifier(random_state=RANDOM_STATE)
+        model_name = "DecisionTree"
     else:
-        joblib.dump(pipelines, final_model_path)
-    print(f'[INFO] Saved model/pipeline to {final_model_path}')
-except Exception as e:
-    print('[WARN] Could not save model pipeline:', e)
+        continue
 
-report_path = args.report_out or os.path.join(
-    results_folder, f'ml_report_{datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}.md'
-)
-ensure_parent_dir(report_path)
-with open(report_path, 'w') as fh:
-    fh.write('# ML Report\n\n')
-    fh.write(f'- Input: {args.input}\n')
-    fh.write(f'- Target: {args.target}\n')
-    fh.write(f'- Excluded columns: {EXCLUDE_COLS}\n')
-    fh.write(f'- Models: {args.models}\n')
-    fh.write(f'- Time split: {args.time_split_ts or args.time_split_minutes}\n')
-    fh.write('\n')
-    fh.write('\n'.join(report_lines))
+    print(f"\n[INFO] Treinando {model_name} ...")
+    model.fit(X_train, y_train)
 
-print(f'[INFO] Report saved to {report_path}')
-print('[INFO] Script finished.')
+    if m == "dt":
+        salvar_arvore_decisao_png(
+            modelo_dt=model,
+            feature_names=X_train.columns,
+            class_names=class_names,
+            filename_png="decisiontree_tree.png",
+            max_depth_plot=4
+        )
+
+    # Sufixo para arquivos quando há avaliação externa
+    suf = "_eval" if use_external_eval else ""
+    _ = avaliar_modelo(model, model_name, X_eval, y_eval, class_names, sufixo=suf)
+
+    shap_bar_with_true_labels(
+        model, X_train, X_for_shap, class_names, model_name,
+        max_display=MAX_DISPLAY, bg_size=SHAP_BG_SIZE, test_size=SHAP_TEST_SIZE, seed=RANDOM_STATE
+    )
+
+    # Salvar modelo + features + classes (um por modelo)
+    joblib.dump(model, outpath(f"{model_name.lower()}_model.joblib"))
+    joblib.dump(X_train.columns.tolist(), outpath(f"{model_name.lower()}_features.joblib"))
+    joblib.dump(class_names, outpath(f"{model_name.lower()}_class_names.joblib"))
+    print(f"[SALVO] Artefatos do {model_name} em: {os.path.abspath(RUN_DIR)}")
+
+print("\n[OK] Concluído.")
