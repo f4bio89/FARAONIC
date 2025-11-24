@@ -1,4 +1,4 @@
-#!./projeto/bin/python
+#!/home/kali/Desktop/arquivos-defensive/Final/projeto/bin/python
 # -*- coding: utf-8 -*-
 
 """
@@ -23,12 +23,12 @@ from typing import List, Tuple, Optional, Dict, Any
 CONFIG = {
     "model_path": "treinamento01.joblib",
     "scripts": {
-        "capture_baseline": "./script/01-captura.py",
-        "upload_baseline": "./script/02-upload_mongodb.py",
-        "query_baseline": "./script/03-perguntas.py",
-        "detect_realtime": "./script/04-deteccao.py",
-        "train": "./script/102-Treinar-ML.py",
-        "realtime": "./script/103-Executar-ML.py",
+        "capture_baseline": "./01-captura.py",
+        "upload_baseline": "./02-upload_mongodb.py",
+        "query_baseline": "./03-perguntas.py",
+        "detect_realtime": "./04-deteccao.py",
+        "train": "./102-Treinar-ML.py",
+        "realtime": "./103-Executar-ML.py",
     },
     # Defaults passed to 01-captura.py
     "capture_defaults": {
@@ -593,16 +593,53 @@ def query_and_realtime(_args=None):
     _run_python_live(CONFIG["scripts"]["detect_realtime"], detect_args)
 
 def train_if_needed(_args=None):
-    rc, out, err, logpath = _run_python_capture(CONFIG["scripts"]["train"], [])
+    """
+    Executa o script de treinamento 102-Treinar-ML.py com os parâmetros
+    padrão definidos para o experimento atual.
+    """
+    train_args = [
+        "--csv", "Modbus_TCP_ Cybersecurity_Dataset_Training.csv",
+        "--sep", ";",
+        "--target", "Classification",
+        "--eval-csv", "Modbus_TCP_ Cybersecurity_Dataset_Validation.csv_",
+        "--eval-sep", ";",
+        "--eval-target", "Classification",
+        # treinar RandomForest e DecisionTree
+        "--model", "rf",
+        "--model", "dt",
+        "--prefix", "experimento",
+    ]
+
+    rc, out, err, logpath = _run_python_capture(CONFIG["scripts"]["train"], train_args)
     if rc != 0:
         print("[!] Train script failed:", logpath)
-        print(err[:800])
+        print(err[:800] or "(no stderr)")
     else:
         print("[OK] Train finished. Log:", logpath)
 
+
 def realtime_exec(_args=None):
-    # always run 103-Executar-ML.py with sudo, but keep venv interpreter
-    rc = _run_python_live(CONFIG["scripts"]["realtime"], [], use_sudo=True)
+    """
+    Executa o script 103-Executar-ML.py em modo live com parâmetros fixos.
+    Sempre usa sudo e o Python do venv atual.
+    """
+    realtime_args = [
+        "--iface", "eth2",
+        "--out", "live_preds.csv",
+        "--threshold", "0.70",
+        "--no-jsonl",
+        "--verbose",
+        "--model", "experimento03/randomforest_model.joblib",
+        "--features", "experimento03/randomforest_features.joblib",
+        "--class-names", "experimento03/randomforest_class_names.joblib",
+    ]
+
+    rc = _run_python_live(
+        CONFIG["scripts"]["realtime"],
+        realtime_args,
+        use_sudo=True
+    )
+
     if rc != 0:
         print("[!] Realtime script failed with code:", rc)
     else:
@@ -724,3 +761,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
