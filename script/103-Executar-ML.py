@@ -1,31 +1,16 @@
-#!./projeto/bin/python
+#!/home/kali/Desktop/arquivos-defensive/Final/projeto/bin/python
+# -*- coding: utf-8 -*-
 """
-103-Executar-ML.py — Sniff/Replay -> Normalize -> Classify (robusto, com defaults opinativos)
+103-Executar-ML.py — Sniff/Replay -> Normalize -> Classify
 
-Defaults (podem ser alterados via CLI):
-  --iface eth2
-  --model mymodels.joblib
-  --jsonl normalized.jsonl
-  --batch-size 128
-  --limit 0
-  --threshold 0.5
-  --out result1.csv
-
-Exemplos:
-  # usar todos os defaults (sniff ao vivo):
-  sudo ./103-Executar-ML.py
-
-  # trocar a interface e o arquivo de saída:
-  sudo ./103-Executar-ML.py --iface ens19 --out ml_out.csv
-
-  # executar em cima de um PCAP (sem precisar de root):
-  ./103-Executar-ML.py --pcap capturas/modbus.pcap --limit 10000
-
-  # mudar o modelo e registrar JSONL em outro caminho:
-  sudo ./103-Executar-ML.py --model mymodels.joblib --jsonl logs/run1.jsonl
+Novidades:
+- Carrega nomes reais das classes (class_names.joblib ou --class-names)
+- Pred/Prob saem com labels amigáveis (ex.: NORMAL, DDOS...)
+- --no-jsonl desliga o JSONL (alternativamente use --jsonl "")
 """
+
 from __future__ import annotations
-import argparse, time, json, os, math
+import argparse, time, json, os, math, sys
 from collections import deque
 import joblib
 import pandas as pd
@@ -36,9 +21,9 @@ from scapy.fields import XShortField, ByteField, ShortField, StrLenField
 from scapy.layers.inet import IP, TCP
 from scapy.all import Raw, PcapReader, conf
 
-# -----------------------------
+# =======================
 # Modbus layers
-# -----------------------------
+# =======================
 class ModbusTCPRequest(Packet):
     name = "ModbusTCPRequest"
     fields_desc = [
@@ -89,9 +74,9 @@ bind_layers(ModbusTCPResponse, ModbusWriteMultipleCoilsResponse, func_code=15)
 
 conf.sniff_promisc = True
 
-# -----------------------------
+# =======================
 # Helpers
-# -----------------------------
+# =======================
 def make_jsonable_deep(obj):
     from collections.abc import Mapping
     if obj is None or isinstance(obj, (str, bool, int, float)):
@@ -175,9 +160,9 @@ def canonical_flow_key(ip_src, ip_dst, sport, dport, proto):
         key = f"{b[0]}:{b[1]}-{a[0]}:{a[1]}/{proto}"; dir_flag = "rev"
     return key, dir_flag
 
-# -----------------------------
+# =======================
 # Flow state
-# -----------------------------
+# =======================
 flow_state = {}
 MAX_FLOWS = 10000
 flow_queue = deque()
@@ -190,9 +175,9 @@ def ensure_flow(key):
         old = flow_queue.popleft()
         flow_state.pop(old, None)
 
-# -----------------------------
+# =======================
 # Normalization
-# -----------------------------
+# =======================
 def normalize_packet(pkt):
     try:
         if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
@@ -356,60 +341,109 @@ def normalize_packet(pkt):
         print("[WARN] normalize_packet exception:", e)
         return None
 
-# -----------------------------
-# Prediction + CSV writer
-# -----------------------------
-def load_pipeline(path):
-    obj = joblib.load(path)
-    if isinstance(obj, dict):
-        for key in ('RandomForest','random_forest','rf','rf_model'):
-            if key in obj:
-                return obj[key]
-        return list(obj.values())[0]
-    return obj
+# =======================
+# Modelo/Features/Classes
+# =======================
+def load_model_and_features(model_path, features_path=None):
+    model = joblib.load(model_path)
+    feat_list = None
+    if features_path and os.path.exists(features_path):
+        try:
+            feat_list = joblib.load(features_path)
+            if isinstance(feat_list, dict):
+                feat_list = feat_list.get('features', None)
+        except Exception:
+            feat_list = None
+    return model, feat_list
 
-def infer_expected_columns(pipeline):
-    expected = None
+def load_class_names(path):
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
     try:
-        pre = pipeline.named_steps.get('prep') if hasattr(pipeline, 'named_steps') else None
-        if pre is not None:
-            t = pre.transformers_
-            num_cols = t[0][2] if len(t)>=1 and isinstance(t[0][2], (list,tuple)) else []
-            cat_cols = t[1][2] if len(t)>=2 and isinstance(t[1][2], (list,tuple)) else []
-            expected = list(num_cols) + list(cat_cols)
-    except Exception:
-        expected = None
-    return expected
+        names = joblib.load(path)
+        if isinstance(names, np.ndarray):
+            names = names.tolist()
+        # garantir strings
+        return [str(x) for x in names]
+    except Exception as e:
+        print(f"[WARN] Falha ao carregar class_names de {path}: {e}")
+        return None
 
-def flush_and_predict(pipeline, buffer_rows, output_csv, first_write, expected_cols, clf_classes, threshold, verbose):
+# =======================
+# Predição + CSV writer
+# =======================
+def align_prob_labels(clf_classes, class_names):
+    """
+    Retorna lista de rótulos para colunas de probabilidade.
+    Tenta mapear clf.classes_ -> nomes em class_names quando possível.
+    """
+    if clf_classes is None:
+        return None
+    labels = []
+    for cls in clf_classes:
+        label = str(cls)
+        if class_names is not None:
+            try:
+                label = class_names[int(cls)]
+            except Exception:
+                # se o classificador já usa strings, mantenha
+                label = str(cls)
+        labels.append(label)
+    return labels
+
+def flush_and_predict(pipeline, buffer_rows, output_csv, first_write, expected_cols,
+                      clf_classes, class_names, threshold, verbose):
     if not buffer_rows:
         return first_write
+
     df = pd.DataFrame(buffer_rows)
+
+    # alinhamento de colunas ao treino
     if expected_cols:
         for c in expected_cols:
             if c not in df.columns:
                 df[c] = np.nan
         df = df[expected_cols]
-    # coercions típicos
-    for c in df.columns:
-        if c.startswith('IP_') or c.startswith('TCP_') or c in ('delta_seq','delta_ack','delta_tsval','iat_flow','ip_id_delta','approx_payload_len'):
-            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    # coerção numérica
+    df = df.apply(pd.to_numeric, errors='coerce').fillna(0)
+
+    # predição
     try:
-        preds = pipeline.predict(df)
+        preds_raw = pipeline.predict(df)
     except Exception as e:
         print("[ERROR] pipeline.predict failed:", e)
-        preds = ["ERROR"] * len(df)
+        preds_raw = ["ERROR"] * len(df)
+
+    # probabilidades
     probs = None
+    prob_labels = None
     try:
         probs = pipeline.predict_proba(df)
+        prob_labels = align_prob_labels(clf_classes, class_names)
     except Exception:
         probs = None
 
+    # mapear nomes das classes em 'pred'
+    mapped_preds = []
+    for p in preds_raw:
+        if class_names is not None:
+            try:
+                mapped_preds.append(class_names[int(p)])
+                continue
+            except Exception:
+                pass
+        mapped_preds.append(str(p))
+
     outdf = df.copy()
-    outdf['pred'] = preds
-    if probs is not None and clf_classes is not None:
-        for i, cls in enumerate(clf_classes):
-            outdf[f'prob_{cls}'] = probs[:, i]
+    outdf['pred'] = mapped_preds
+
+    # anexar colunas de probabilidade
+    if probs is not None:
+        for i, lbl in enumerate(prob_labels or []):
+            outdf[f'prob_{lbl}'] = probs[:, i]
 
     mode = 'w' if first_write else 'a'
     header = first_write
@@ -417,16 +451,23 @@ def flush_and_predict(pipeline, buffer_rows, output_csv, first_write, expected_c
     if verbose:
         print(f"[INFO] Wrote {len(outdf)} rows to {output_csv} (header={header})")
 
+    # alerts
     for idx, row in outdf.iterrows():
-        pred = row['pred']
+        pred = str(row['pred']).upper()
         prob = None
-        if probs is not None and clf_classes is not None:
+        if probs is not None and prob_labels:
+            # tenta pegar prob da classe prevista
             try:
-                prob = row[f'prob_{pred}']
+                prob = row[f'prob_{row["pred"]}']
             except Exception:
-                prob = row[[c for c in outdf.columns if c.startswith('prob_')]].max()
-        if str(pred).upper() != 'NORMAL' and (prob is None or prob >= threshold):
-            print(f"[ALERT] pred={pred} prob={prob} flow={buffer_rows[idx].get('flow_id')} modbus_func={buffer_rows[idx].get('modbus_func')}")
+                # fallback: maior prob
+                prob_cols = [f'prob_{l}' for l in prob_labels]
+                avail = [c for c in prob_cols if c in outdf.columns]
+                prob = row[avail].max() if avail else None
+
+        if pred != 'NORMAL' and (prob is None or prob >= threshold):
+            orig = buffer_rows[idx]
+            print(f"[ALERT] pred={row['pred']} prob={prob} flow={orig.get('flow_id')} modbus_func={orig.get('modbus_func')}")
     return False
 
 def safe_write_jsonl(path, row):
@@ -450,15 +491,17 @@ def safe_write_jsonl(path, row):
             pass
         return False
 
-# -----------------------------
+# =======================
 # Runners
-# -----------------------------
-def run_from_pcap(pcap_path, pipeline, expected_cols, out_csv, jsonl_path, batch_size, replay_speed, threshold, verbose, limit):
+# =======================
+def run_from_pcap(pcap_path, pipeline, expected_cols, out_csv, jsonl_path,
+                  batch_size, replay_speed, threshold, verbose, limit, class_names):
     print(f"[INFO] Replaying pcap {pcap_path}")
     reader = PcapReader(pcap_path)
     last_ts = None
     buffer = []
     first_write = not os.path.exists(out_csv)
+
     try:
         if hasattr(pipeline, 'named_steps') and 'clf' in pipeline.named_steps and hasattr(pipeline.named_steps['clf'], 'classes_'):
             clf_classes = pipeline.named_steps['clf'].classes_
@@ -477,7 +520,8 @@ def run_from_pcap(pcap_path, pipeline, expected_cols, out_csv, jsonl_path, batch
                     safe_write_jsonl(jsonl_path, row)
                 buffer.append(row)
             if len(buffer) >= batch_size:
-                first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols, clf_classes, threshold, verbose)
+                first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols,
+                                                clf_classes, class_names, threshold, verbose)
                 buffer.clear()
             if replay_speed and replay_speed > 0:
                 try:
@@ -495,12 +539,15 @@ def run_from_pcap(pcap_path, pipeline, expected_cols, out_csv, jsonl_path, batch
             print("[WARN] exception while processing pcap pkt, skipping:", ex)
             continue
     if buffer:
-        first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols, clf_classes, threshold, verbose)
+        first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols,
+                                        clf_classes, class_names, threshold, verbose)
     print("[INFO] Replay finished.")
 
-def run_live(iface, pipeline, expected_cols, out_csv, jsonl_path, batch_size, threshold, verbose, limit):
+def run_live(iface, pipeline, expected_cols, out_csv, jsonl_path,
+             batch_size, threshold, verbose, limit, class_names):
     print(f"[INFO] Listening on iface {iface} (press Ctrl-C to stop)")
     first_write = not os.path.exists(out_csv)
+
     try:
         if hasattr(pipeline, 'named_steps') and 'clf' in pipeline.named_steps and hasattr(pipeline.named_steps['clf'], 'classes_'):
             clf_classes = pipeline.named_steps['clf'].classes_
@@ -522,7 +569,8 @@ def run_live(iface, pipeline, expected_cols, out_csv, jsonl_path, batch_size, th
                     safe_write_jsonl(jsonl_path, row)
                 buffer.append(row)
             if len(buffer) >= batch_size:
-                first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols, clf_classes, threshold, verbose)
+                first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols,
+                                                clf_classes, class_names, threshold, verbose)
                 buffer.clear()
             if pkt_count <= 5 or pkt_count % 200 == 0:
                 print(f"[HEARTBEAT] total pkts processed: {pkt_count} buffered: {len(buffer)}")
@@ -550,53 +598,86 @@ def run_live(iface, pipeline, expected_cols, out_csv, jsonl_path, batch_size, th
         print("[ERROR] Sniffer failed:", e)
     finally:
         if buffer:
-            first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols, clf_classes, threshold, verbose)
+            first_write = flush_and_predict(pipeline, buffer, out_csv, first_write, expected_cols,
+                                            clf_classes, class_names, threshold, verbose)
         print("[INFO] Live sniff finished.")
 
-# -----------------------------
-# CLI e main (com defaults)
-# -----------------------------
+# =======================
+# CLI / Main
+# =======================
 def main():
-    ap = argparse.ArgumentParser(description="Sniff/Replay -> normalize -> classify (robust, with sensible defaults).")
+    ap = argparse.ArgumentParser(description="Sniff/Replay -> normalize -> classify (com labels de classe).")
 
-    # Fonte de dados: por default usamos --iface=eth2; --pcap continua disponível
+    # Fonte de dados
     grp = ap.add_mutually_exclusive_group(required=False)
     ap.add_argument('--iface', default='eth2', help='interface para sniff ao vivo (default: eth2)')
     grp.add_argument('--pcap', help='arquivo pcap para replay')
 
-    ap.add_argument('--model', default='mymodels.joblib', help='pipeline/modelo .joblib (default: mymodels.joblib)')
-    ap.add_argument('--out', default='result1.csv', help='CSV de saída (features + pred + probs) (default: result1.csv)')
-    ap.add_argument('--jsonl', default='normalized.jsonl', help='caminho do JSONL normalizado (default: normalized.jsonl)')
+    # Modelo e metadados
+    ap.add_argument('--model', default='mymodels.joblib', help='modelo .joblib (default: mymodels.joblib)')
+    ap.add_argument('--features', default='model_features.joblib', help='lista de colunas do treino (default: model_features.joblib)')
+    ap.add_argument('--class-names', default='class_names.joblib', help='arquivo com nomes reais das classes (default: class_names.joblib)')
+
+    # Saídas
+    ap.add_argument('--out', default='result1.csv', help='CSV de saída (alinhado + pred + probs)')
+    ap.add_argument('--jsonl', default='normalized.jsonl', help='caminho do JSONL normalizado (vazio para desabilitar)')
+    ap.add_argument('--no-jsonl', action='store_true', help='desabilita JSONL independente do --jsonl')
+
+    # Execução
     ap.add_argument('--batch-size', type=int, default=128, help='tamanho do lote para predição (default: 128)')
     ap.add_argument('--replay-speed', type=float, default=0.0, help='>0 respeita timestamps do pcap com esse multiplicador')
-    ap.add_argument('--limit', type=int, default=0, help='parar após N pacotes (0 = sem limite) (default: 0)')
+    ap.add_argument('--limit', type=int, default=0, help='parar após N pacotes (0 = sem limite)')
     ap.add_argument('--threshold', type=float, default=0.5, help='limiar de probabilidade para alertas (default: 0.5)')
     ap.add_argument('--verbose', action='store_true', help='logs adicionais')
 
     args = ap.parse_args()
 
-    # Se o usuário passou --pcap, ignoramos --iface; caso contrário, exige root para sniff.
+    # Determinar fonte (iface exige root)
     source_mode = 'pcap' if args.pcap else 'iface'
     if source_mode == 'iface' and os.geteuid() != 0:
         print("[ERROR] Live sniffing requires root. Rode com sudo ou use --pcap.")
         return
 
-    print(f"[INFO] Loading pipeline {args.model} ...")
-    pipeline = load_pipeline(args.model)
-    expected_cols = infer_expected_columns(pipeline)
+    # JSONL enable/disable
+    jsonl_path = (args.jsonl or "").strip()
+    if args.no_jsonl or jsonl_path == "":
+        jsonl_path = None
+
+    # Carregar modelo e features
+    if not os.path.exists(args.model):
+        print(f"[ERROR] Modelo não encontrado: {args.model}")
+        sys.exit(1)
+    print(f"[INFO] Loading model {args.model} ...")
+    model, features = load_model_and_features(args.model, args.features)
+
+    # Carregar nomes de classe
+    class_names = load_class_names(args.class_names)
+    if class_names:
+        print(f"[INFO] class_names: {class_names}")
+    else:
+        print("[WARN] class_names ausentes; usando rótulos do estimador.")
+
+    pipeline = model
+    expected_cols = features
+
     if expected_cols:
         print(f"[INFO] Model expects {len(expected_cols)} columns. Example: {expected_cols[:10]}")
     else:
-        print("[WARN] Could not infer expected columns from pipeline.prep; will try best-effort alignment.")
+        print("[WARN] No feature list found; will try best-effort alignment.")
 
+    # Garantir diretórios de saída
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
-    if args.jsonl:
-        os.makedirs(os.path.dirname(os.path.abspath(args.jsonl)) or '.', exist_ok=True)
+    if jsonl_path:
+        os.makedirs(os.path.dirname(os.path.abspath(jsonl_path)) or '.', exist_ok=True)
 
+    # Rodar
     if source_mode == 'pcap':
-        run_from_pcap(args.pcap, pipeline, expected_cols, args.out, args.jsonl, args.batch_size, args.replay_speed, args.threshold, args.verbose, args.limit or None)
+        run_from_pcap(args.pcap, pipeline, expected_cols, args.out, jsonl_path,
+                      args.batch_size, args.replay_speed, args.threshold, args.verbose,
+                      args.limit or None, class_names)
     else:
-        run_live(args.iface, pipeline, expected_cols, args.out, args.jsonl, args.batch_size, args.threshold, args.verbose, args.limit or None)
+        run_live(args.iface, pipeline, expected_cols, args.out, jsonl_path,
+                 args.batch_size, args.threshold, args.verbose, args.limit or None, class_names)
 
     print("[INFO] Done.")
 
