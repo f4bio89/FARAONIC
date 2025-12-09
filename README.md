@@ -221,8 +221,4 @@ Choose a license (e.g., MIT, Apache-2.0) and add it as `LICENSE`.
 
 ## Acknowledgements
 
-Created by **Fabio Araujo**. Inspired by real-world ICS monitoring needs and the spirit of pragmatic security engineering.
-
----
-
-If you want, I can also add badges (build, license, Python version), a minimal `requirements.txt`, and a short GIF demo section.
+Created by **Fabio Araujo**. Inspired by real-world ICS monitoring needs.
